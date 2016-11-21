@@ -1,4 +1,4 @@
-package nodes
+package ddpool
 
 import "github.com/relvacode/gpool"
 

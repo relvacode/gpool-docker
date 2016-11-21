@@ -1,9 +1,9 @@
-// Package nodes is a utility for extending the gpool package with distributed docker back-ends.
+// Package ddpool is a utility for extending the gpool package with distributed docker back-ends.
 // Each configured node in a NodeBridge attaches to an instance of a docker client with a set amount of concurrent workers on that node.
 // When a job is executed on a node, the node is given to the job via a context value.
 // During execution, a health check go routine checks the status of the Docker engine to ensure it is up.
 // If a node goes down no further jobs will be scheduled to the node but existing jobs will continue to execute.
-package nodes
+package ddpool
 
 import (
 	"context"
