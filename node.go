@@ -7,11 +7,13 @@ package ddpool
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"time"
+
 	"github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
 	"github.com/relvacode/gpool"
-	"sync"
-	"time"
 )
 
 // TotalSizer is an interface which implement TotalSize.
@@ -19,6 +21,14 @@ import (
 type TotalSizer interface {
 	// TotalSize returns the total size of the job in bytes.
 	TotalSize() int64
+}
+
+type ErrHeld struct {
+	Reason string
+}
+
+func (err *ErrHeld) Error() string {
+	return fmt.Sprintf("node held: %s", err.Reason)
 }
 
 // worker is an instance of a worker on a node.
@@ -55,6 +65,7 @@ func NewNode(Docker *DockerInstance, Workers uint, Cap uint64) *Node {
 		m:              Cap,
 		workerCh:       make(chan chan *gpool.JobStatus),
 		healthCh:       make(chan HealthStatus),
+		holdCh:         make(chan *string),
 		healthCond:     sync.NewCond(&sync.Mutex{}),
 	}
 }
@@ -69,6 +80,7 @@ type Node struct {
 	workerCh chan chan *gpool.JobStatus
 
 	healthCh   chan HealthStatus
+	holdCh     chan *string
 	healthCond *sync.Cond
 
 	exc uint
@@ -115,6 +127,15 @@ func (n *Node) Evaluate(q []*gpool.JobStatus) (int, bool) {
 // Calling Health is safe for concurrent access.
 func (n *Node) Health() HealthStatus {
 	return <-n.healthCh
+}
+
+func (n *Node) Hold(reason string) {
+	msg := &reason
+	n.holdCh <- msg
+}
+
+func (n *Node) Release() {
+	n.holdCh <- nil
 }
 
 func (n *Node) check(ctx context.Context, health *HealthStatus) error {
@@ -164,7 +185,26 @@ func (n *Node) monitor() {
 	for {
 		select {
 		case <-t.C:
+			// Do not check health if node is in the held state
+			if health.Held {
+				continue
+			}
 			n.check(ctx, health)
+		case msg := <-n.holdCh:
+			if msg == nil && health.Held {
+				// Release the node if held
+				health.Held = false
+				n.check(ctx, health)
+				continue
+			}
+			if msg != nil {
+				health.Held = true
+				health.Healthy = false
+				health.Error = &ErrHeld{
+					Reason: *msg,
+				}
+				continue
+			}
 		case n.healthCh <- *health:
 		case <-n.br.ctx.Done():
 			// If done allow the orchestrator to continue and exit.

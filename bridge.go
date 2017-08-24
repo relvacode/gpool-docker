@@ -2,8 +2,9 @@ package ddpool
 
 import (
 	"context"
-	"github.com/relvacode/gpool"
 	"sync"
+
+	"github.com/relvacode/gpool"
 )
 
 // NewNodeBridge creates a new node bridge with the given nodes.
@@ -44,6 +45,16 @@ func (br *NodeBridge) Request() <-chan *gpool.Transaction {
 
 func (br *NodeBridge) Return() <-chan *gpool.JobStatus {
 	return br.returnCh
+}
+
+// Node gets a specific node by ID
+func (br *NodeBridge) Node(id string) *Node {
+	for _, n := range br.Nodes {
+		if n.ID == id {
+			return n
+		}
+	}
+	return nil
 }
 
 func (br *NodeBridge) Exit() <-chan struct{} {
