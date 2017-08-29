@@ -109,6 +109,11 @@ func (n *Node) done(j *gpool.JobStatus) {
 
 // Evaluate evaluates a list of JobStatuses in a pool queue and returns the first job that can fit in the node.
 func (n *Node) Evaluate(q []*gpool.JobStatus) (int, bool) {
+	// Do not evaluate an unhealthy node
+	health := <-n.healthCh
+	if !health.Healthy {
+		return 0, false
+	}
 	n.mtx.RLock()
 	defer n.mtx.RUnlock()
 	for idx, j := range q {
@@ -216,21 +221,27 @@ func (n *Node) monitor() {
 	}
 }
 
+func (n *Node) checkHealthBeforeSchedule() {
+	health := <-n.healthCh
+	if !health.Healthy {
+		logrus.Infof("Node %s blocked waiting for healthy broadcast", n.ID)
+		n.healthCond.L.Lock()
+		n.healthCond.Wait()
+		n.healthCond.L.Unlock()
+		logrus.Infof("Node %s healthy broadcast received", n.ID)
+	}
+}
+
 func (n *Node) orchestrate() {
 	t := &gpool.Transaction{
 		Evaluate: n.Evaluate,
 		Return:   make(chan *gpool.JobStatus),
 	}
 	for {
-		health := <-n.healthCh
-		if !health.Healthy {
-			logrus.Infof("Node %s blocked waiting for healthy broadcast", n.ID)
-			n.healthCond.L.Lock()
-			n.healthCond.Wait()
-			n.healthCond.L.Unlock()
-			logrus.Infof("Node %s healthy broadcast received", n.ID)
-		}
-
+		// Check initial health for each orchestration loop
+		// Health is checked again during an evaluate call to prevent health changes after a request
+		// to the bridge is made.
+		n.checkHealthBeforeSchedule()
 		var req chan *gpool.JobStatus
 
 		select {
@@ -246,6 +257,7 @@ func (n *Node) orchestrate() {
 		case n.br.requestCh <- t:
 			j := <-t.Return
 			// If no job could be scheduled then inform the worker
+
 			if j == nil {
 				req <- nil
 				continue
