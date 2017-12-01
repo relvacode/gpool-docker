@@ -157,6 +157,7 @@ func (n *Node) check(ctx context.Context, health *HealthStatus) error {
 
 	// If error is clear and previously had an error
 	if err == nil && health.Error != nil {
+		logrus.Infof("Node %q reconnected")
 		health.Healthy = true
 		health.Error = nil
 		n.healthCond.L.Lock()
@@ -167,7 +168,7 @@ func (n *Node) check(ctx context.Context, health *HealthStatus) error {
 		return nil
 	}
 	if health.Healthy {
-		logrus.Warnf("Node %s down! %s", n.ID, err)
+		logrus.Warnf("Node %q down! %s", n.ID, err)
 		health.Healthy = false
 		health.Error = err
 	}
@@ -176,7 +177,7 @@ func (n *Node) check(ctx context.Context, health *HealthStatus) error {
 
 // monitor the health of the node and prevent jobs from being scheduled if node is down.
 func (n *Node) monitor() {
-	logrus.Infof("Staring health monitor for node %s on %s", n.ID, n.Hostname)
+	logrus.Infof("Staring health monitor for node %q on %q", n.ID, n.Hostname)
 	t := time.NewTicker(time.Second * 10)
 	defer t.Stop()
 
