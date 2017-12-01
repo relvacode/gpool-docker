@@ -57,7 +57,10 @@ func (w *worker) work() {
 }
 
 // NewNode extends a DockerNode to implement a Node with a set amount of workers and storage capacity.
-func NewNode(Docker *DockerInstance, Workers uint, Cap uint64) *Node {
+func NewNode(Docker *DockerInstance, Strategy gpool.ScheduleStrategy, Workers uint, Cap uint64) *Node {
+	if Strategy == nil {
+		Strategy = gpool.DefaultStrategy
+	}
 	return &Node{
 		DockerInstance: Docker,
 		Workers:        Workers,
@@ -75,6 +78,7 @@ type Node struct {
 	*DockerInstance
 	Workers uint
 
+	strategy gpool.ScheduleStrategy
 	mtx      *sync.RWMutex
 	br       *NodeBridge
 	workerCh chan chan *gpool.JobStatus
@@ -116,15 +120,38 @@ func (n *Node) Evaluate(q []*gpool.JobStatus) (int, bool) {
 	}
 	n.mtx.RLock()
 	defer n.mtx.RUnlock()
-	for idx, j := range q {
+
+	var available []*gpool.JobStatus
+
+	// Find jobs that will fit to this node
+	for _, j := range q {
 		if d, ok := j.Job().(TotalSizer); ok {
 			if uint64(d.TotalSize()) < (n.m - n.c) {
-				return idx, true
+				available = append(available, j)
 			}
 		} else {
+			available = append(available, j)
+		}
+	}
+
+	if len(available) == 0 {
+		return 0, false
+	}
+
+	// Ask the underlying strategy to pick an available job
+	index, ok := n.strategy(available)
+	if !ok {
+		return 0, false
+	}
+
+	// If found, get the actual index of the job
+	id := available[index].ID
+	for idx, j := range q {
+		if j.ID == id {
 			return idx, true
 		}
 	}
+
 	return 0, false
 }
 
