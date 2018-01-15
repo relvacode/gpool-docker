@@ -64,6 +64,7 @@ func NewNode(Docker *DockerInstance, Strategy gpool.ScheduleStrategy, Workers ui
 	return &Node{
 		DockerInstance: Docker,
 		Workers:        Workers,
+		strategy:       Strategy,
 		mtx:            &sync.RWMutex{},
 		m:              Cap,
 		workerCh:       make(chan chan *gpool.JobStatus),
@@ -184,7 +185,7 @@ func (n *Node) check(ctx context.Context, health *HealthStatus) error {
 
 	// If error is clear and previously had an error
 	if err == nil && health.Error != nil {
-		logrus.Infof("Node %q reconnected")
+		logrus.Infof("Node %q reconnected", n.ID)
 		health.Healthy = true
 		health.Error = nil
 		n.healthCond.L.Lock()
