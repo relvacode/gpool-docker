@@ -16,6 +16,10 @@ import (
 	"github.com/relvacode/gpool"
 )
 
+var (
+	ErrExecuting = errors.New("node: cannot remove node that has active jobs")
+)
+
 // TotalSizer is an interface which implement TotalSize.
 // The job being executed on the node should implement this method for storage allocation.
 type TotalSizer interface {
@@ -42,6 +46,8 @@ func (w *worker) work() {
 	for {
 		select {
 		case <-w.n.br.ctx.Done():
+			return
+		case <-w.n.dieWorkerCh:
 			return
 		case w.n.workerCh <- c:
 			j := <-c
@@ -70,6 +76,8 @@ func NewNode(Docker *DockerInstance, Strategy gpool.ScheduleStrategy, Workers ui
 		healthCh:       make(chan HealthStatus),
 		holdCh:         make(chan *string),
 		healthCond:     sync.NewCond(&sync.Mutex{}),
+		dieCh:          make(chan chan error),
+		dieWorkerCh:    make(chan struct{}),
 	}
 }
 
@@ -84,8 +92,12 @@ type Node struct {
 	workerCh chan chan *gpool.JobStatus
 
 	healthCh   chan HealthStatus
-	holdCh     chan *string
 	healthCond *sync.Cond
+
+	holdCh      chan *string
+	dieCh       chan chan error // receive channel, send result on reply channel
+	dieWorkerCh chan struct{}   // signal to workers to exit
+	isDead      bool
 
 	exc uint
 	m   uint64
@@ -184,7 +196,7 @@ func (n *Node) check(ctx context.Context, health *HealthStatus) error {
 
 	// If error is clear and previously had an error
 	if err == nil && health.Error != nil {
-		logrus.Infof("Node %q reconnected")
+		logrus.Warnf("Node %q reconnected")
 		health.Healthy = true
 		health.Error = nil
 		n.healthCond.L.Lock()
@@ -195,7 +207,7 @@ func (n *Node) check(ctx context.Context, health *HealthStatus) error {
 		return nil
 	}
 	if health.Healthy {
-		logrus.Warnf("Node %q down! %s", n.ID, err)
+		logrus.Errorf("Node %q down! %s", n.ID, err)
 		health.Healthy = false
 		health.Error = err
 	}
@@ -260,11 +272,36 @@ func (n *Node) checkHealthBeforeSchedule() {
 	}
 }
 
+func (n *Node) tryToDie(reply chan error) bool {
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+	if n.isDead {
+		return false
+	}
+
+	logrus.Warnf("Attempting to remove node %s (%d executing)", n.ID, n.exc)
+	if n.exc != 0 {
+		reply <- ErrExecuting
+		return false
+	}
+	close(n.dieWorkerCh)
+	n.isDead = true
+	reply <- nil
+	return true
+}
+
 func (n *Node) orchestrate() {
 	t := &gpool.Transaction{
 		Evaluate: n.Evaluate,
 		Return:   make(chan *gpool.JobStatus),
 	}
+
+	// Print die status on exit
+	defer func() {
+		logrus.Errorf("Node %s is dead", n.ID)
+	}()
+
+orch:
 	for {
 		// Check initial health for each orchestration loop
 		// Health is checked again during an evaluate call to prevent health changes after a request
@@ -276,11 +313,22 @@ func (n *Node) orchestrate() {
 		case <-n.br.ctx.Done():
 			return
 		case req = <-n.workerCh:
+		case die := <-n.dieCh:
+			if !n.tryToDie(die) {
+				continue orch
+			}
+			return
 		}
 
 		select {
 		case <-n.br.ctx.Done():
 			req <- nil
+			return
+		case die := <-n.dieCh:
+			req <- nil
+			if !n.tryToDie(die) {
+				continue orch
+			}
 			return
 		case n.br.requestCh <- t:
 			j := <-t.Return
