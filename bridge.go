@@ -47,6 +47,13 @@ type NodeBridge struct {
 	returnCh  chan *gpool.JobStatus
 }
 
+// Len is a thread safe way to inspect the number of configured nodes in the system
+func (br *NodeBridge) Len() int {
+	br.mtx.Lock()
+	defer br.mtx.Unlock()
+	return len(br.Nodes)
+}
+
 // Request is used to interface with the pool.
 // Should never be used directly.
 func (br *NodeBridge) Request() <-chan *gpool.Transaction {
