@@ -12,6 +12,18 @@ const (
 	DefaultHostname = "unix:///var/run/docker.sock"
 )
 
+func NewDockerClientInstance(client *docker.Client) (*DockerInstance, error) {
+	inf, err := client.Info()
+	if err != nil {
+		return nil, errors.Wrap(err, "Get node information")
+	}
+	return &DockerInstance{
+		ID:       inf.ID,
+		Hostname: client.Endpoint(),
+		Client:   client,
+	}, nil
+}
+
 // NewDockerInstance creates a new DockerInstance using the given hostname.
 // If CertPath and TLSVerify is set then use a TLS connection.
 // The Docker engine will be contacted during node creation to ensure a connection can be made.
@@ -32,15 +44,7 @@ func NewDockerInstance(Hostname, CertPath string, TLSVerify bool) (*DockerInstan
 		return nil, errors.Wrapf(err, "Parse host %s", Hostname)
 	}
 
-	inf, err := c.Info()
-	if err != nil {
-		return nil, errors.Wrap(err, "Get node information")
-	}
-	return &DockerInstance{
-		ID:       inf.ID,
-		Hostname: Hostname,
-		Client:   c,
-	}, nil
+	return NewDockerClientInstance(c)
 }
 
 // DockerInstance wraps a Docker client with the node ID and hostname of that node.

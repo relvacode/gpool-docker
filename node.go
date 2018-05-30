@@ -16,6 +16,10 @@ import (
 	"github.com/relvacode/gpool"
 )
 
+var (
+	ErrNodeExecuting = errors.New("node: cannot remove node that has active jobs")
+)
+
 // TotalSizer is an interface which implement TotalSize.
 // The job being executed on the node should implement this method for storage allocation.
 type TotalSizer interface {
@@ -23,6 +27,7 @@ type TotalSizer interface {
 	TotalSize() int64
 }
 
+// ErrHeld indicates that the node is unhealthy because it is current held
 type ErrHeld struct {
 	Reason string
 }
@@ -42,6 +47,8 @@ func (w *worker) work() {
 	for {
 		select {
 		case <-w.n.br.ctx.Done():
+			return
+		case <-w.n.dieWorkerCh:
 			return
 		case w.n.workerCh <- c:
 			j := <-c
@@ -66,15 +73,17 @@ func NewNode(Docker *DockerInstance, Strategy gpool.ScheduleStrategy, Workers ui
 		Workers:        Workers,
 		strategy:       Strategy,
 		mtx:            &sync.RWMutex{},
-		m:              Cap,
 		workerCh:       make(chan chan *gpool.JobStatus),
 		healthCh:       make(chan HealthStatus),
 		holdCh:         make(chan *string),
 		healthCond:     sync.NewCond(&sync.Mutex{}),
+		dieCh:          make(chan chan error),
+		dieWorkerCh:    make(chan struct{}),
+		cap:            Cap,
 	}
 }
 
-// A Node wraps a DockerNode so that it can be used in a
+// A Node wraps a DockerNode so that it can be used in a Docker pool
 type Node struct {
 	*DockerInstance
 	Workers uint
@@ -85,12 +94,16 @@ type Node struct {
 	workerCh chan chan *gpool.JobStatus
 
 	healthCh   chan HealthStatus
-	holdCh     chan *string
 	healthCond *sync.Cond
 
-	exc uint
-	m   uint64
-	c   uint64
+	holdCh      chan *string
+	dieCh       chan chan error // receive channel, send result on reply channel
+	dieWorkerCh chan struct{}   // signal to workers to exit
+	isDead      bool
+
+	exc   uint
+	alloc uint64
+	cap   uint64
 }
 
 // Status returns the current allocation and execution status of the node.
@@ -98,14 +111,14 @@ type Node struct {
 func (n *Node) Status() (allocated uint64, capacity uint64, executing uint) {
 	n.mtx.RLock()
 	defer n.mtx.RUnlock()
-	allocated, capacity, executing = n.c, n.m, n.exc
+	allocated, capacity, executing = n.alloc, n.cap, n.exc
 	return
 }
 
 func (n *Node) done(j *gpool.JobStatus) {
 	n.mtx.Lock()
 	if d, ok := j.Job().(TotalSizer); ok {
-		n.c -= uint64(d.TotalSize())
+		n.alloc -= uint64(d.TotalSize())
 	}
 	n.exc--
 	n.mtx.Unlock()
@@ -127,7 +140,7 @@ func (n *Node) Evaluate(q []*gpool.JobStatus) (int, bool) {
 	// Find jobs that will fit to this node
 	for _, j := range q {
 		if d, ok := j.Job().(TotalSizer); ok {
-			if uint64(d.TotalSize()) < (n.m - n.c) {
+			if uint64(d.TotalSize()) < (n.cap - n.alloc) {
 				available = append(available, j)
 			}
 		} else {
@@ -196,7 +209,7 @@ func (n *Node) check(ctx context.Context, health *HealthStatus) error {
 		return nil
 	}
 	if health.Healthy {
-		logrus.Warnf("Node %q down! %s", n.ID, err)
+		logrus.Errorf("Node %q down! %s", n.ID, err)
 		health.Healthy = false
 		health.Error = err
 	}
@@ -250,59 +263,129 @@ func (n *Node) monitor() {
 	}
 }
 
-func (n *Node) checkHealthBeforeSchedule() {
-	health := <-n.healthCh
-	if !health.Healthy {
-		logrus.Infof("Node %s blocked waiting for healthy broadcast", n.ID)
-		n.healthCond.L.Lock()
-		n.healthCond.Wait()
-		n.healthCond.L.Unlock()
-		logrus.Infof("Node %s healthy broadcast received", n.ID)
+func (n *Node) tryToDie(reply chan error) bool {
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+	if n.isDead {
+		return false
 	}
+
+	logrus.Warnf("Attempting to remove node %s (%d executing)", n.ID, n.exc)
+	if n.exc != 0 {
+		reply <- ErrNodeExecuting
+		return false
+	}
+	close(n.dieWorkerCh)
+	n.isDead = true
+	reply <- nil
+	return true
 }
 
+// checkHealthBeforeSchedule checks the health of the node
+// before scheduling excecution of the job.
+// If a message is made to die or the bridge conext is cancelled the true is returned
+func (n *Node) checkHealthBeforeSchedule() bool {
+	health := <-n.healthCh
+	if health.Healthy {
+		return false
+	}
+	logrus.Infof("Node %s blocked waiting for healthy broadcast", n.ID)
+
+	// Lock the health condition and wait for it to exit
+	n.healthCond.L.Lock()
+	ok := make(chan struct{})
+	go func() {
+		n.healthCond.Wait()
+		n.healthCond.L.Unlock()
+		close(ok)
+	}()
+	select {
+	case <-ok:
+		logrus.Infof("Node %s healthy broadcast received", n.ID)
+	case <-n.br.ctx.Done():
+		return true
+	case die := <-n.dieCh:
+		if n.tryToDie(die) {
+			return true
+		}
+	}
+	return false
+}
+
+// orchestrate receives requests for work from a worker and forwards it to the bridge.
+// It calls the bridge evalutation strategy on all jobs that will fit within the current capacity of the node.
 func (n *Node) orchestrate() {
 	t := &gpool.Transaction{
 		Evaluate: n.Evaluate,
 		Return:   make(chan *gpool.JobStatus),
 	}
+
+	// Print die status on exit
+	defer logrus.Errorf("Node %q is dead", n.ID)
+
+orch:
 	for {
 		// Check initial health for each orchestration loop
 		// Health is checked again during an evaluate call to prevent health changes after a request
 		// to the bridge is made.
-		n.checkHealthBeforeSchedule()
+		// Returning if true ensures that if a kill signal is attempted then it is able to complete
+		// without waiting for a healthly status first.
+		if exit := n.checkHealthBeforeSchedule(); exit {
+			return
+		}
 		var req chan *gpool.JobStatus
 
 		select {
 		case <-n.br.ctx.Done():
+			// signal to immediately die from bridge
+			// cancelling the context causes the node to exit immediately.
+			// the workers will continue running unil their cancelletion takes affect.
+			// The bridge will not exit until the waitgroup counting number of workers is finished.
 			return
-		case req = <-n.workerCh:
+		case req = <-n.workerCh: // work request from worker
+		case die := <-n.dieCh: // node kill signal
+			if !n.tryToDie(die) {
+				continue orch
+			}
+			return
 		}
 
 		select {
-		case <-n.br.ctx.Done():
+		case <-n.br.ctx.Done(): // signal to die immediately
 			req <- nil
 			return
-		case n.br.requestCh <- t:
-			j := <-t.Return
-			// If no job could be scheduled then inform the worker
+		case die := <-n.dieCh: // node kill signal
+			req <- nil
+			if !n.tryToDie(die) {
+				continue orch
+			}
+			return
+		case n.br.requestCh <- t: // send node request to bridge
+
+			j := <-t.Return // got given this job
 
 			if j == nil {
+				// If no job could be scheduled then inform the worker and continue with next loop
 				req <- nil
 				continue
 			}
+
+			// Update currently allocated capacity and increment execution count
 			n.mtx.Lock()
 			if d, ok := j.Job().(TotalSizer); ok {
-				n.c += uint64(d.TotalSize())
+				n.alloc += uint64(d.TotalSize())
 			}
 			n.exc++
 			n.mtx.Unlock()
+
+			// Return job back to worker
 			req <- j
 		}
 
 	}
 }
 
+// start begins orchestrating and working on jobs
 func (n *Node) start() {
 	logrus.Infof("Node %s starting %d worker(s)", n.ID, n.Workers)
 	for i := uint(0); i < n.Workers; i++ {
