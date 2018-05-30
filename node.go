@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	ErrExecuting = errors.New("node: cannot remove node that has active jobs")
+	ErrNodeExecuting = errors.New("node: cannot remove node that has active jobs")
 )
 
 // TotalSizer is an interface which implement TotalSize.
@@ -262,17 +262,6 @@ func (n *Node) monitor() {
 	}
 }
 
-func (n *Node) checkHealthBeforeSchedule() {
-	health := <-n.healthCh
-	if !health.Healthy {
-		logrus.Infof("Node %s blocked waiting for healthy broadcast", n.ID)
-		n.healthCond.L.Lock()
-		n.healthCond.Wait()
-		n.healthCond.L.Unlock()
-		logrus.Infof("Node %s healthy broadcast received", n.ID)
-	}
-}
-
 func (n *Node) tryToDie(reply chan error) bool {
 	n.mtx.Lock()
 	defer n.mtx.Unlock()
@@ -282,13 +271,45 @@ func (n *Node) tryToDie(reply chan error) bool {
 
 	logrus.Warnf("Attempting to remove node %s (%d executing)", n.ID, n.exc)
 	if n.exc != 0 {
-		reply <- ErrExecuting
+		reply <- ErrNodeExecuting
 		return false
 	}
 	close(n.dieWorkerCh)
 	n.isDead = true
 	reply <- nil
 	return true
+}
+
+// checkHealthBeforeSchedule checks the health of the node
+// before scheduling excecution of the job.
+// If a message is made to die or the bridge conext is cancelled the true is returned
+func (n *Node) checkHealthBeforeSchedule() bool {
+	health := <-n.healthCh
+	if health.Healthy {
+		return false
+	}
+	logrus.Infof("Node %s blocked waiting for healthy broadcast", n.ID)
+
+	// Lock the health condition and wait for it to exit
+	n.healthCond.L.Lock()
+	ok := make(chan struct{})
+	go func() {
+		n.healthCond.Wait()
+		n.healthCond.L.Unlock()
+		close(ok)
+	}()
+	select {
+	case <-ok:
+		logrus.Infof("Node %s healthy broadcast received", n.ID)
+	case <-n.br.ctx.Done():
+		return true
+	case die := <-n.dieCh:
+		logrus.Debugf("Node %q attempting to die under unhealthy state", n.ID)
+		if n.tryToDie(die) {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) orchestrate() {
@@ -307,7 +328,11 @@ orch:
 		// Check initial health for each orchestration loop
 		// Health is checked again during an evaluate call to prevent health changes after a request
 		// to the bridge is made.
-		n.checkHealthBeforeSchedule()
+		// Returning if false ensures that if a kill signal is attempted then it is able to complete
+		// without waiting for a healthly status first.
+		if exit := n.checkHealthBeforeSchedule(); exit {
+			return
+		}
 		var req chan *gpool.JobStatus
 
 		select {

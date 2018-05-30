@@ -21,7 +21,7 @@ func NewNodeBridge(nodes ...*Node) *NodeBridge {
 	br := &NodeBridge{
 		wg:        &sync.WaitGroup{},
 		mtx:       new(sync.Mutex),
-		Nodes:     nodes,
+		nodes:     nodes,
 		requestCh: make(chan *gpool.Transaction),
 		returnCh:  make(chan *gpool.JobStatus),
 		ctx:       ctx,
@@ -36,7 +36,7 @@ func NewNodeBridge(nodes ...*Node) *NodeBridge {
 
 // NodeBridge connects one or more Nodes to a pool ready to execute jobs.
 type NodeBridge struct {
-	Nodes []*Node
+	nodes []*Node
 	mtx   *sync.Mutex
 	wg    *sync.WaitGroup
 
@@ -51,7 +51,18 @@ type NodeBridge struct {
 func (br *NodeBridge) Len() int {
 	br.mtx.Lock()
 	defer br.mtx.Unlock()
-	return len(br.Nodes)
+	return len(br.nodes)
+}
+
+// NodeStatus returns a snapshot of the status of all nodes in the bridge
+func (br *NodeBridge) NodeStatus() []NodeStatus {
+	br.mtx.Lock()
+	defer br.mtx.Unlock()
+	var statuses = make([]NodeStatus, len(br.nodes))
+	for i := 0; i < len(br.nodes); i ++ {
+		statuses[i] = NewNodeStatus(br.nodes[i])
+	}
+	return statuses
 }
 
 // Request is used to interface with the pool.
@@ -71,7 +82,7 @@ func (br *NodeBridge) Add(n *Node) error {
 	defer br.mtx.Unlock()
 
 	// Check for existing node with same ID
-	for _, en := range br.Nodes {
+	for _, en := range br.nodes {
 		if en.ID == n.ID {
 			return ErrNodeAlreadyExists
 		}
@@ -80,7 +91,7 @@ func (br *NodeBridge) Add(n *Node) error {
 	// Assign and start the node
 	n.br = br
 	n.start()
-	br.Nodes = append(br.Nodes, n)
+	br.nodes = append(br.nodes, n)
 
 	return nil
 }
@@ -90,7 +101,7 @@ func (br *NodeBridge) Node(id string) (*Node, error) {
 	br.mtx.Lock()
 	defer br.mtx.Unlock()
 
-	for _, n := range br.Nodes {
+	for _, n := range br.nodes {
 		if n.ID == id {
 			return n, nil
 		}
@@ -108,7 +119,7 @@ func (br *NodeBridge) Remove(id string) error {
 
 	var at int
 	var node *Node
-	for i, n := range br.Nodes {
+	for i, n := range br.nodes {
 		if n.ID == id {
 			at = i
 			node = n
@@ -130,7 +141,7 @@ func (br *NodeBridge) Remove(id string) error {
 	}
 
 	// Delete nodes from list of our tracked nodes
-	br.Nodes = append(br.Nodes[:at], br.Nodes[at+1:]...)
+	br.nodes = append(br.nodes[:at], br.nodes[at+1:]...)
 	return nil
 }
 
@@ -140,7 +151,7 @@ func (br *NodeBridge) MaxCapacity() uint64 {
 	defer br.mtx.Unlock()
 
 	var maxCap uint64
-	for _, n := range br.Nodes {
+	for _, n := range br.nodes {
 		_, capacity, _ := n.Status()
 		if capacity > maxCap {
 			maxCap = capacity
